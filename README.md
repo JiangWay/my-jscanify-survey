@@ -1,2 +1,3 @@
 # my-jscanify-survey
-套用jscanify在Vue3專案上
+
+套用 jscanify 在 Vue3 專案上
