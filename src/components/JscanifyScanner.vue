@@ -28,9 +28,18 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted } from "vue";
+import { ref, onMounted, onUnmounted, watch } from "vue";
 import jscanify from "jscanify/src/jscanify";
 import cv from "@techstark/opencv-js";
+import { useScannerConfig } from "../composables/useScannerConfig";
+
+const {
+  CAMERA_CONFIG,
+  CANVAS_CONFIG,
+  SCANNER_PREVIEW_CONFIG,
+  CROP_MARGIN,
+  UPDATE_INTERVAL,
+} = useScannerConfig();
 
 const videoElement = ref(null);
 const sourceCanvas = ref(null);
@@ -40,65 +49,81 @@ const croppedImage = ref([]);
 let scanner = null;
 let streamInterval = null;
 
-onMounted(async () => {
+// 新增初始化方法
+const initializeScanner = async () => {
   try {
     window.cv = cv;
     scanner = new jscanify();
     isReady.value = true;
     console.log("OpenCV 載入成功");
+  } catch (error) {
+    console.error("初始化掃描器失敗:", error);
+    isReady.value = false;
+  }
+};
 
+// 新增初始化相機串流函數
+const initializeVideoStream = async (sourceCtx) => {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia(CAMERA_CONFIG);
+    videoElement.value.srcObject = stream;
+
+    return new Promise((resolve) => {
+      videoElement.value.onloadedmetadata = () => {
+        videoElement.value.play();
+        resolve();
+      };
+    });
+  } catch (error) {
+    console.error("初始化相機串流失敗：", error);
+    throw error;
+  }
+};
+
+// 新增處理視訊幀函數
+const processVideoFrame = (sourceCtx) => {
+  sourceCtx.drawImage(
+    videoElement.value,
+    0,
+    0,
+    sourceCanvas.value.width,
+    sourceCanvas.value.height
+  );
+
+  const previewResult = scanner.highlightPaper(
+    sourceCanvas.value,
+    SCANNER_PREVIEW_CONFIG
+  );
+
+  const previewCtx = previewCanvas.value.getContext("2d");
+  previewCtx.clearRect(
+    0,
+    0,
+    previewCanvas.value.width,
+    previewCanvas.value.height
+  );
+  previewCtx.drawImage(previewResult, 0, 0);
+};
+
+onMounted(async () => {
+  try {
+    await initializeScanner();
     const sourceCtx = sourceCanvas.value.getContext("2d");
 
-    // 設定 canvas 尺寸
-    sourceCanvas.value.width = 480;
-    sourceCanvas.value.height = 640;
-    previewCanvas.value.width = 480;
-    previewCanvas.value.height = 640;
+    // 設置畫布尺寸
+    sourceCanvas.value.width = CANVAS_CONFIG.width;
+    sourceCanvas.value.height = CANVAS_CONFIG.height;
+    previewCanvas.value.width = CANVAS_CONFIG.width;
+    previewCanvas.value.height = CANVAS_CONFIG.height;
 
-    navigator.mediaDevices
-      .getUserMedia({
-        video: {
-          facingMode: "environment",
-          width: { ideal: 1920 },
-          height: { ideal: 1080 },
-          aspectRatio: { ideal: 4 / 3 },
-          focusMode: "continuous", // 自動持續對焦
-          exposureMode: "continuous", // 自動持續曝光
-        },
-      })
-      .then((stream) => {
-        videoElement.value.srcObject = stream;
-        videoElement.value.onloadedmetadata = () => {
-          videoElement.value.play();
+    // 初始化視訊串流
+    await initializeVideoStream(sourceCtx);
 
-          streamInterval = setInterval(() => {
-            // 繪製視訊畫面到來源 canvas
-            sourceCtx.drawImage(
-              videoElement.value,
-              0,
-              0,
-              sourceCanvas.value.width,
-              sourceCanvas.value.height
-            );
-
-            // 使用 highlightPaper 進行預覽
-            const previewResult = scanner.highlightPaper(sourceCanvas.value, {
-              color: "orange",
-              thickness: 3,
-            });
-
-            // 將預覽結果顯示在預覽畫布上
-            const previewCtx = previewCanvas.value.getContext("2d");
-            previewCtx.clearRect(
-              0,
-              0,
-              previewCanvas.value.width,
-              previewCanvas.value.height
-            );
-            previewCtx.drawImage(previewResult, 0, 0);
-          }, 100);
-        };
-      });
+    // 設置定時處理視訊幀
+    streamInterval = setInterval(
+      () => processVideoFrame(sourceCtx),
+      UPDATE_INTERVAL
+    );
   } catch (error) {
     console.error("初始化掃描器失敗：", error);
   }
@@ -116,20 +141,20 @@ const cropDocument = () => {
       // 將識別出來的corners 範圍稍稍加大
       const expandedCorners = {
         bottomLeftCorner: {
-          x: corners.bottomLeftCorner.x - 10,
-          y: corners.bottomLeftCorner.y - 10,
+          x: corners.bottomLeftCorner.x - CROP_MARGIN,
+          y: corners.bottomLeftCorner.y - CROP_MARGIN,
         },
         bottomRightCorner: {
-          x: corners.bottomRightCorner.x + 10,
-          y: corners.bottomRightCorner.y + 10,
+          x: corners.bottomRightCorner.x + CROP_MARGIN,
+          y: corners.bottomRightCorner.y + CROP_MARGIN,
         },
         topLeftCorner: {
-          x: corners.topLeftCorner.x - 10,
-          y: corners.topLeftCorner.y - 10,
+          x: corners.topLeftCorner.x - CROP_MARGIN,
+          y: corners.topLeftCorner.y - CROP_MARGIN,
         },
         topRightCorner: {
-          x: corners.topRightCorner.x + 10,
-          y: corners.topRightCorner.y - 10,
+          x: corners.topRightCorner.x + CROP_MARGIN,
+          y: corners.topRightCorner.y - CROP_MARGIN,
         },
       };
       // 利用座標計算出裁切區域的寬度和高度
@@ -142,8 +167,8 @@ const cropDocument = () => {
       // 執行裁切
       const extractedPaper = scanner.extractPaper(
         sourceCanvas.value,
-        640,
-        480,
+        CANVAS_CONFIG.height,
+        CANVAS_CONFIG.width,
         expandedCorners
       );
 
@@ -163,9 +188,6 @@ const cropDocument = () => {
 onUnmounted(() => {
   if (streamInterval) {
     clearInterval(streamInterval);
-  }
-  if (videoElement.value?.srcObject) {
-    videoElement.value.srcObject.getTracks().forEach((track) => track.stop());
   }
 });
 </script>
