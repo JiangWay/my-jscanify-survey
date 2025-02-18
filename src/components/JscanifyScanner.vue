@@ -9,16 +9,34 @@
     ></video>
     <canvas ref="sourceCanvas" style="display: none"></canvas>
 
+    <!-- 新增進度條 -->
+    <div class="progress-bar">
+      <div
+        class="progress-fill"
+        :style="{ width: `${validRatioCount * 33.33}%` }"
+      ></div>
+    </div>
+
     <!-- 預覽畫布 -->
-    <canvas ref="previewCanvas" class="preview-canvas"></canvas>
+    <canvas
+      ref="previewCanvas"
+      class="preview-canvas"
+      v-show="!isPaused"
+    ></canvas>
 
-    <!-- 裁切按鈕 -->
-    <button @click="cropDocument" class="crop-button">確認裁切</button>
-
+    <!-- 新增重新掃描按鈕 -->
+    <button v-if="isPaused" @click="restartScanning" class="restart-button">
+      重新掃描
+    </button>
     <!-- 裁切結果顯示區 -->
-    <div v-if="croppedImage" class="cropped-result">
+    <div v-if="croppedImages" class="cropped-result">
       <h3>裁切結果：</h3>
-      <div v-for="(image, index) in croppedImage" :key="index">
+      <div
+        v-for="(image, index) in croppedImages"
+        :key="index"
+        class="image-container"
+      >
+        <span class="image-index">{{ croppedImages.length - index }}</span>
         <img :src="image" alt="裁切結果" class="cropped-image" />
       </div>
     </div>
@@ -28,10 +46,10 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted, watch } from "vue";
-import jscanify from "jscanify/src/jscanify";
+import { ref, onMounted, onUnmounted } from "vue";
 import cv from "@techstark/opencv-js";
 import { useScannerConfig } from "../composables/useScannerConfig";
+import { loadScript } from "../utils/cdnLoader";
 
 const {
   CAMERA_CONFIG,
@@ -39,21 +57,31 @@ const {
   SCANNER_PREVIEW_CONFIG,
   CROP_MARGIN,
   UPDATE_INTERVAL,
+  ID_CARD_RATIO,
+  JSCANIFY_SCRIPT_URL,
 } = useScannerConfig();
 
 const videoElement = ref(null);
 const sourceCanvas = ref(null);
 const previewCanvas = ref(null);
 const isReady = ref(false);
-const croppedImage = ref([]);
+const croppedImages = ref([]);
 let scanner = null;
-let streamInterval = null;
+
+let ratioCheckInterval = null;
+const validRatioCount = ref(0);
+let animationFrameId = null;
+const isPaused = ref(false);
 
 // 新增初始化方法
 const initializeScanner = async () => {
   try {
     window.cv = cv;
-    scanner = new jscanify();
+    if (!window.jscanify) {
+      await loadScript(JSCANIFY_SCRIPT_URL, { async: true });
+    }
+    console.log("window.jscanify", window.jscanify);
+    scanner = new window.jscanify();
     isReady.value = true;
     console.log("OpenCV 載入成功");
   } catch (error) {
@@ -63,9 +91,10 @@ const initializeScanner = async () => {
 };
 
 // 新增初始化相機串流函數
-const initializeVideoStream = async (sourceCtx) => {
+const initializeVideoStream = async () => {
   try {
     const stream = await navigator.mediaDevices.getUserMedia(CAMERA_CONFIG);
+    console.log("stream", stream);
     videoElement.value.srcObject = stream;
 
     return new Promise((resolve) => {
@@ -105,9 +134,51 @@ const processVideoFrame = (sourceCtx) => {
   previewCtx.drawImage(previewResult, 0, 0);
 };
 
+// 新增檢查寬高比的函數
+const checkAspectRatio = () => {
+  try {
+    const img = cv.imread(sourceCanvas.value);
+    const contour = scanner.findPaperContour(img);
+    if (contour) {
+      const corners = scanner.getCornerPoints(contour);
+      const width = corners.bottomRightCorner.x - corners.bottomLeftCorner.x;
+      const height = corners.topRightCorner.y - corners.bottomRightCorner.y;
+      const currentRatio = Math.abs(width / height);
+      console.log("ID_CARD_RATIO.MIN", ID_CARD_RATIO.MIN);
+      console.log("currentRatio", currentRatio);
+      console.log("ID_CARD_RATIO.MAX", ID_CARD_RATIO.MAX);
+      console.log("validRatioCount", validRatioCount.value);
+      if (
+        currentRatio >= ID_CARD_RATIO.MIN &&
+        currentRatio <= ID_CARD_RATIO.MAX
+      ) {
+        validRatioCount.value++;
+        if (validRatioCount.value >= 3) {
+          cropDocument(corners);
+        }
+      } else {
+        validRatioCount.value = 0;
+      }
+    }
+
+    img.delete();
+  } catch (error) {
+    console.error("檢查寬高比失敗：", error);
+  }
+};
+
+const processVideoFrameLoop = (sourceCtx) => {
+  processVideoFrame(sourceCtx);
+  animationFrameId = requestAnimationFrame(() =>
+    processVideoFrameLoop(sourceCtx)
+  );
+};
+
 onMounted(async () => {
   try {
     await initializeScanner();
+    await initializeVideoStream();
+
     const sourceCtx = sourceCanvas.value.getContext("2d");
 
     // 設置畫布尺寸
@@ -116,78 +187,96 @@ onMounted(async () => {
     previewCanvas.value.width = CANVAS_CONFIG.width;
     previewCanvas.value.height = CANVAS_CONFIG.height;
 
-    // 初始化視訊串流
-    await initializeVideoStream(sourceCtx);
+    // 設置視訊幀更新
+    processVideoFrameLoop(sourceCtx);
 
-    // 設置定時處理視訊幀
-    streamInterval = setInterval(
-      () => processVideoFrame(sourceCtx),
-      UPDATE_INTERVAL
-    );
+    // 設置寬高比檢查（每 500ms 檢查一次）
+    ratioCheckInterval = setInterval(checkAspectRatio, UPDATE_INTERVAL);
   } catch (error) {
     console.error("初始化掃描器失敗：", error);
   }
 });
 
 // 裁切文件函數
-const cropDocument = () => {
+const cropDocument = (corners) => {
   try {
-    const img = cv.imread(sourceCanvas.value);
-    const contour = scanner.findPaperContour(img);
+    // 將識別出來的corners 範圍稍稍加大
+    const expandedCorners = {
+      bottomLeftCorner: {
+        x: corners.bottomLeftCorner.x - CROP_MARGIN,
+        y: corners.bottomLeftCorner.y - CROP_MARGIN,
+      },
+      bottomRightCorner: {
+        x: corners.bottomRightCorner.x + CROP_MARGIN,
+        y: corners.bottomRightCorner.y + CROP_MARGIN,
+      },
+      topLeftCorner: {
+        x: corners.topLeftCorner.x - CROP_MARGIN,
+        y: corners.topLeftCorner.y - CROP_MARGIN,
+      },
+      topRightCorner: {
+        x: corners.topRightCorner.x + CROP_MARGIN,
+        y: corners.topRightCorner.y - CROP_MARGIN,
+      },
+    };
+    // 利用座標計算出裁切區域的寬度和高度
+    const width =
+      expandedCorners.bottomRightCorner.x - expandedCorners.bottomLeftCorner.x;
+    const height =
+      expandedCorners.topRightCorner.y - expandedCorners.bottomRightCorner.y;
+    // 執行裁切
+    const extractedPaper = scanner.extractPaper(
+      sourceCanvas.value,
+      CANVAS_CONFIG.height,
+      CANVAS_CONFIG.width,
+      expandedCorners
+    );
 
-    if (contour) {
-      const corners = scanner.getCornerPoints(contour);
-      console.log("corners", corners);
-      // 將識別出來的corners 範圍稍稍加大
-      const expandedCorners = {
-        bottomLeftCorner: {
-          x: corners.bottomLeftCorner.x - CROP_MARGIN,
-          y: corners.bottomLeftCorner.y - CROP_MARGIN,
-        },
-        bottomRightCorner: {
-          x: corners.bottomRightCorner.x + CROP_MARGIN,
-          y: corners.bottomRightCorner.y + CROP_MARGIN,
-        },
-        topLeftCorner: {
-          x: corners.topLeftCorner.x - CROP_MARGIN,
-          y: corners.topLeftCorner.y - CROP_MARGIN,
-        },
-        topRightCorner: {
-          x: corners.topRightCorner.x + CROP_MARGIN,
-          y: corners.topRightCorner.y - CROP_MARGIN,
-        },
-      };
-      // 利用座標計算出裁切區域的寬度和高度
-      const width =
-        expandedCorners.bottomRightCorner.x -
-        expandedCorners.bottomLeftCorner.x;
-      const height =
-        expandedCorners.topRightCorner.y - expandedCorners.bottomRightCorner.y;
-      console.log(width, height);
-      // 執行裁切
-      const extractedPaper = scanner.extractPaper(
-        sourceCanvas.value,
-        CANVAS_CONFIG.height,
-        CANVAS_CONFIG.width,
-        expandedCorners
-      );
-
-      if (extractedPaper) {
-        // 將裁切結果轉換為 base64 圖片
-        croppedImage.value.push(extractedPaper.toDataURL("image/jpeg"));
+    if (extractedPaper) {
+      croppedImages.value.unshift(extractedPaper.toDataURL("image/jpeg"));
+      // 停止掃描
+      isPaused.value = true;
+      if (animationFrameId) {
+        cancelAnimationFrame(animationFrameId);
+        animationFrameId = null;
+      }
+      if (ratioCheckInterval) {
+        clearInterval(ratioCheckInterval);
+        ratioCheckInterval = null;
       }
     }
-
-    img.delete();
   } catch (error) {
     console.error("裁切文件失敗：", error);
   }
 };
 
+// 新增重新開始掃描函數
+const restartScanning = () => {
+  isPaused.value = false;
+  validRatioCount.value = 0;
+  const sourceCtx = sourceCanvas.value.getContext("2d");
+
+  // 重新開始視訊幀處理
+  processVideoFrameLoop(sourceCtx);
+
+  // 重新開始比例檢查
+  ratioCheckInterval = setInterval(checkAspectRatio, 500);
+};
+
 // 在組件卸載時清理
 onUnmounted(() => {
-  if (streamInterval) {
-    clearInterval(streamInterval);
+  if (animationFrameId) {
+    cancelAnimationFrame(animationFrameId);
+  }
+  if (ratioCheckInterval) {
+    clearInterval(ratioCheckInterval);
+  }
+  if (videoElement.value?.srcObject) {
+    const tracks = videoElement.value.srcObject.getTracks();
+    tracks.forEach((track) => track.stop());
+  }
+  if (scanner) {
+    scanner.dispose && scanner.dispose();
   }
 });
 </script>
@@ -195,42 +284,34 @@ onUnmounted(() => {
 <style scoped>
 .scanner-container {
   width: 100%;
-  max-width: 640px;
+  max-width: 540px;
   margin: 0 auto;
   position: relative;
   background-color: #f8f8f8;
   padding: 20px;
+  min-height: 100vh; /* 確保容器至少佔滿螢幕高度 */
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  box-sizing: border-box;
 }
 
 .preview-canvas {
   width: 100%;
   height: 100%;
-  aspect-ratio: 3/4; /* 保持 4:3 的寬高比 */
+  aspect-ratio: 9 / 16;
   object-fit: contain;
   border-radius: 8px;
   margin-bottom: 1rem;
   border: 2px solid #ec1010;
 }
 
-.crop-button {
-  display: block;
-  width: 100%;
-  padding: 12px;
-  background-color: #4caf50;
-  color: white;
-  border: none;
-  border-radius: 4px;
-  font-size: 16px;
-  cursor: pointer;
-  margin: 1rem 0;
-}
-
-.crop-button:hover {
-  background-color: #45a049;
-}
-
 .cropped-result {
   margin-top: 2rem;
+}
+
+.cropped-result h3 {
+  color: #666666; /* 設定為灰色 */
 }
 
 .cropped-image {
@@ -250,5 +331,78 @@ onUnmounted(() => {
   color: white;
   padding: 1rem;
   border-radius: 4px;
+}
+
+.image-container {
+  position: relative;
+  margin-bottom: 1rem;
+}
+
+.image-index {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  background-color: rgba(0, 0, 0, 0.7);
+  color: white;
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 14px;
+  z-index: 1;
+}
+
+.progress-bar {
+  width: 100%;
+  height: 4px;
+  background-color: #e0e0e0;
+  border-radius: 2px;
+  margin: 8px 0;
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  background-color: #4caf50;
+  transition: width 0.3s ease-out;
+}
+
+.restart-button {
+  display: block;
+  margin: 1rem auto;
+  padding: 0.8rem 1.5rem;
+  background-color: #4caf50;
+  color: white;
+  border: none;
+  border-radius: 4px;
+  font-size: 1rem;
+  cursor: pointer;
+  transition: background-color 0.3s;
+}
+
+.restart-button:hover {
+  background-color: #45a049;
+}
+
+/* 新增 RWD 相關樣式 */
+@media screen and (max-width: 768px) {
+  .scanner-container {
+    padding: 10px;
+    max-width: 100%;
+  }
+
+  .preview-canvas {
+    width: 100%;
+    max-height: 80vh; /* 避免在手機上太高 */
+  }
+
+  .restart-button {
+    width: 100%;
+    max-width: 300px;
+    padding: 12px;
+    font-size: 16px; /* 在手機上增加按鈕大小，更容易點擊 */
+  }
+
+  .cropped-image {
+    margin-bottom: 0.5rem;
+  }
 }
 </style>
